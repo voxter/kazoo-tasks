@@ -1,38 +1,45 @@
 %%%-------------------------------------------------------------------
-%%% @copyright (C) 2013-2017, 2600Hz INC
+%%% @copyright (C) 2017, 2600Hz
 %%% @doc
 %%%
 %%% @end
 %%% @contributors
-%%%   Peter Defebvre
 %%%-------------------------------------------------------------------
--module(knm_port_request_crawler).
--behaviour(gen_server).
+-module(tasks_maint_listener).
+-behaviour(gen_listener).
 
-%% API
 -export([start_link/0
-        ,stop/0
+        ,handle_req/2
         ]).
 
-%% gen_server callbacks
 -export([init/1
         ,handle_call/3
         ,handle_cast/2
         ,handle_info/2
+        ,handle_event/2
         ,terminate/2
         ,code_change/3
         ]).
 
 -include("tasks.hrl").
--include_lib("kazoo_number_manager/include/knm_phone_number.hrl").
+-include_lib("kazoo_amqp/include/kz_amqp.hrl").
 
--define(CLEANUP_ROUNDTRIP_TIME
-       ,kapps_config:get_integer(?CONFIG_CAT, <<"crawler_delay_time_ms">>, ?MILLISECONDS_IN_MINUTE)
-       ).
+-define(SERVER, ?MODULE).
 
--record(state, {cleanup_ref :: reference()
-               }).
+-record(state, {}).
 -type state() :: #state{}.
+
+%% By convention, we put the options here in macros, but not required.
+%% define what databases or classifications we're interested in
+-define(RESTRICTIONS, [kapi_maintenance:restrict_to_views_db(?KZ_TASKS_DB)]).
+-define(BINDINGS, [{'maintenance', [{'restrict_to', ?RESTRICTIONS}]}]).
+-define(RESPONDERS, [{{?MODULE, 'handle_req'}
+                     ,[{<<"maintenance">>, <<"req">>}]
+                     }
+                    ]).
+-define(QUEUE_NAME, <<?MODULE_STRING>>).
+-define(QUEUE_OPTIONS, [{'exclusive', 'false'}]).
+-define(CONSUME_OPTIONS, [{'exclusive', 'false'}]).
 
 %%%===================================================================
 %%% API
@@ -43,14 +50,38 @@
 %%--------------------------------------------------------------------
 -spec start_link() -> startlink_ret().
 start_link() ->
-    gen_server:start_link(?MODULE, [], []).
+    gen_listener:start_link(?SERVER
+                           ,[{'bindings', ?BINDINGS}
+                            ,{'responders', ?RESPONDERS}
+                            ,{'queue_name', ?QUEUE_NAME}       % optional to include
+                            ,{'queue_options', ?QUEUE_OPTIONS} % optional to include
+                            ,{'consume_options', ?CONSUME_OPTIONS} % optional to include
+                            ,{'declare_exchanges', [{?EXCHANGE_SYSCONF, ?TYPE_SYSCONF}]}
+                            ]
+                           ,[]
+                           ).
 
--spec stop() -> 'ok'.
-stop() ->
-    gen_server:cast(?MODULE, 'stop').
+-spec handle_req(kapi_maintenance:req(), kz_proplist()) -> 'ok'.
+handle_req(MaintJObj, _Props) ->
+    'true' = kapi_maintenance:req_v(MaintJObj),
+    handle_refresh(MaintJObj, kapi_maintenance:req_action(MaintJObj)).
 
-cleanup_timer() ->
-    erlang:start_timer(?CLEANUP_ROUNDTRIP_TIME, self(), 'ok').
+handle_refresh(MaintJObj, <<"refresh_views">>) ->
+    _ = kz_datamgr:revise_views_from_folder(?KZ_TASKS_DB, 'tasks'),
+    send_resp(MaintJObj, 'true').
+
+-spec send_resp(kapi_mainteannce:req(), 'true') -> 'ok'.
+send_resp(MaintJObj, Results) ->
+    Resp = [{<<"Code">>, code(Results)}
+           ,{<<"Message">>, message(Results)}
+           ,{<<"Msg-ID">>, kz_api:msg_id(MaintJObj)}
+            | kz_api:default_headers(?APP_NAME, ?APP_VERSION)
+           ],
+    kapi_maintenance:publish_resp(kz_api:server_id(MaintJObj), Resp).
+
+code('true') -> 200.
+
+message('true') -> <<"Success">>.
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -58,27 +89,19 @@ cleanup_timer() ->
 
 %%--------------------------------------------------------------------
 %% @private
-%% @doc
-%% Initializes the server
-%%
+%% @doc Initializes the server
 %% @spec init(Args) -> {ok, State} |
 %%                     {ok, State, Timeout} |
 %%                     ignore |
 %%                     {stop, Reason}
-%% @end
 %%--------------------------------------------------------------------
 -spec init([]) -> {'ok', state()}.
 init([]) ->
-    kz_util:put_callid(?MODULE),
-    knm_port_request:init(),
-    lager:debug("started ~s", [?MODULE]),
-    {'ok', #state{cleanup_ref=cleanup_timer()}}.
+    {'ok', #state{}}.
 
 %%--------------------------------------------------------------------
 %% @private
-%% @doc
-%% Handling call messages
-%%
+%% @doc Handling call messages
 %% @spec handle_call(Request, From, State) ->
 %%                                   {reply, Reply, State} |
 %%                                   {reply, Reply, State, Timeout} |
@@ -86,7 +109,6 @@ init([]) ->
 %%                                   {noreply, State, Timeout} |
 %%                                   {stop, Reason, Reply, State} |
 %%                                   {stop, Reason, State}
-%% @end
 %%--------------------------------------------------------------------
 -spec handle_call(any(), pid_ref(), state()) -> handle_call_ret_state(state()).
 handle_call(_Request, _From, State) ->
@@ -94,39 +116,38 @@ handle_call(_Request, _From, State) ->
 
 %%--------------------------------------------------------------------
 %% @private
-%% @doc
-%% Handling cast messages
-%%
+%% @doc Handling cast messages
 %% @spec handle_cast(Msg, State) -> {noreply, State} |
 %%                                  {noreply, State, Timeout} |
 %%                                  {stop, Reason, State}
-%% @end
 %%--------------------------------------------------------------------
 -spec handle_cast(any(), state()) -> handle_cast_ret_state(state()).
-handle_cast('stop', State) ->
-    lager:debug("crawler has been stopped"),
-    {'stop', 'normal', State};
+handle_cast({'gen_listener', {'created_queue', _QueueNAme}}, State) ->
+    {'noreply', State};
+handle_cast({'gen_listener', {'is_consuming', _IsConsuming}}, State) ->
+    {'noreply', State};
 handle_cast(_Msg, State) ->
-    lager:debug("unhandled cast: ~p", [_Msg]),
     {'noreply', State}.
 
 %%--------------------------------------------------------------------
 %% @private
-%% @doc
-%% Handling all non call/cast messages
-%%
+%% @doc Handling all non call/cast messages
 %% @spec handle_info(Info, State) -> {noreply, State} |
 %%                                   {noreply, State, Timeout} |
 %%                                   {stop, Reason, State}
-%% @end
 %%--------------------------------------------------------------------
 -spec handle_info(any(), state()) -> handle_info_ret_state(state()).
-handle_info({'timeout', Ref, _Msg}, #state{cleanup_ref=Ref}=State) ->
-    _ = kz_util:spawn(fun crawl_port_requests/0),
-    {'noreply', State#state{cleanup_ref=cleanup_timer()}, 'hibernate'};
-handle_info(_Msg, State) ->
-    lager:debug("unhandled msg: ~p", [_Msg]),
+handle_info(_Info, State) ->
     {'noreply', State}.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc Allows listener to pass options to handlers
+%% @spec handle_event(JObj, State) -> {reply, Options}
+%%--------------------------------------------------------------------
+-spec handle_event(kz_json:object(), kz_proplist()) -> gen_listener:handle_event_return().
+handle_event(_JObj, _State) ->
+    {'reply', []}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -135,21 +156,17 @@ handle_info(_Msg, State) ->
 %% terminate. It should be the opposite of Module:init/1 and do any
 %% necessary cleaning up. When it returns, the gen_server terminates
 %% with Reason. The return value is ignored.
-%%
-%% @spec terminate(Reason, State) -> void()
 %% @end
+%% @spec terminate(Reason, State) -> void()
 %%--------------------------------------------------------------------
 -spec terminate(any(), state()) -> 'ok'.
 terminate(_Reason, _State) ->
-    lager:debug("~s terminating: ~p", [?MODULE, _Reason]).
+    lager:debug("listener terminating: ~p", [_Reason]).
 
 %%--------------------------------------------------------------------
 %% @private
-%% @doc
-%% Convert process state when code is changed
-%%
+%% @doc Convert process state when code is changed
 %% @spec code_change(OldVsn, State, Extra) -> {ok, NewState}
-%% @end
 %%--------------------------------------------------------------------
 -spec code_change(any(), state(), any()) -> {'ok', state()}.
 code_change(_OldVsn, State, _Extra) ->
@@ -158,9 +175,3 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
-
--spec crawl_port_requests() -> 'ok'.
-crawl_port_requests() ->
-    Start = kz_time:now(),
-    knm_port_request:send_submitted_requests(),
-    lager:info("port_request crawler completed a full crawl in ~pms", [kz_time:elapsed_ms(Start)]).
